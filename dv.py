@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+"""
+-Leonardo Granados
+-CS 4470
+-Programming Assignment #2 Distance Vector
+-11/11/25
+"""
 
 import socket
 import struct
