@@ -31,7 +31,9 @@ neighbor_vectors: Dict[int, Dict[int, float]] = {}
 
 
 # ---------- Initialization ----------
-def init_core(self_id: int, all_server_ids: List[int], neighbor_costs: Dict[int, float], update_interval: int) -> None:
+def init_core(self_id: int, all_server_ids: List[int],
+              neighbor_costs: Dict[int, float],
+              update_interval: int) -> None:
     """
     Initialize Role-B core.
     - self_id: this server's ID
@@ -109,7 +111,10 @@ def snapshot() -> List[Tuple[int, int, float]]:
     C will print in the exact format required by the spec.
     """
     _require_init()
-    return sorted([(d, routing_table[d][0], routing_table[d][1]) for d in routing_table], key=lambda x: x[0])
+    return sorted(
+        [(d, routing_table[d][0], routing_table[d][1]) for d in routing_table],
+        key=lambda x: x[0],
+    )
 
 
 def get_and_reset_packets() -> int:
@@ -168,6 +173,15 @@ def _recompute_all() -> None:
             new_table[d] = (_self_id, 0.0)
             continue
 
+        # *** NEW LOGIC: if d is a direct neighbor whose link has been set to INF
+        # (by expire_silent_neighbors after a crash/timeout), then we must treat
+        # that destination as completely unreachable from this router, regardless
+        # of what other neighbors claim. This prevents count-to-infinity and
+        # matches the spec's "neighbor no longer exists in the network" wording.
+        if d in direct[_self_id] and direct[_self_id][d] >= INF:
+            new_table[d] = (_self_id, INF)
+            continue
+
         best_cost = direct[_self_id].get(d, INF)
         best_nh = d if best_cost < INF else _self_id
 
@@ -184,6 +198,7 @@ def _recompute_all() -> None:
         new_table[d] = (best_nh, float(best_cost))
 
     routing_table = new_table
+
 
 def _require_init() -> None:
     if _self_id is None or _update_interval is None:
