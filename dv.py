@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
--Leonardo Granados
+-Leonardo Granados, Cooper Palmer
 -CS 4470
 -Programming Assignment #2 Distance Vector
 -11/11/25
@@ -22,6 +22,8 @@ state = {
     "sock":        None,
     "timer":       None,
     "interval":    None,
+
+    "packets_received": 0,
 }
 
 #LG
@@ -56,7 +58,7 @@ def parse_topology(topology_file):
         idx = idx + 1
         i = i + 1
 
-    links = []                      # links topology array 
+    links = []                      # links topology array
     i = 0
 
     while i < num_neighbors:        # while loop to go through neighbors
@@ -74,7 +76,7 @@ def parse_topology(topology_file):
 
     ## commented out for testing local only for now
     #local_ip = socket.gethostbyname(socket.gethostname())   # gets self ip
-    
+
     #this is only for testing locally
     local_ip = "127.0.0.1"
 
@@ -94,7 +96,7 @@ def parse_topology(topology_file):
     if own_id is None:                                      # if ip is not found or if file is not setup correctly stops program and error msg
         sys.exit("ERROR: local IP not found in topology file")
 
-    neighbors = []                                          
+    neighbors = []
     for a, b, cost in links:                                # for loop to create the links and neighbors and puts them in the list
         if a == own_id:
             ip, port = all_servers[b]
@@ -155,7 +157,7 @@ def build_update_packet():
         cost[nid] = c
     for sid in state["all_servers"]:                # for loop to make the unreachable servers infinity
         if sid not in cost:
-            cost[sid] = -1.0                     
+            cost[sid] = -1.0
 
     #IV --- replace cost with snapshot from routing_core when available ---
     try:
@@ -176,11 +178,11 @@ def build_update_packet():
         pass
     #IV --- end snapshot substitution ---
 
-    pkt = struct.pack("!I", len(cost))              # number of update fields, !I means network int 4 byte 
+    pkt = struct.pack("!I", len(cost))              # number of update fields, !I means network int 4 byte
     pkt += struct.pack("!H", state["own_port"])     # own port, means network, !H meants network short 2 byte
     pkt += socket.inet_aton(state["own_ip"])        # own IP 4 byte
 
-    
+
     for sid in cost:                                # for loop to prepare udp packet to send the info to all neighbors
         ip, port = state["all_servers"][sid]
         pkt += socket.inet_aton(ip)             # dest IP
@@ -218,11 +220,18 @@ def schedule_next_update():
     t.start()                                           # timer starts
     state["timer"] = t                                  # timer placed in public state
 
+# *** NEW HELPER: check if a server is still an active neighbor ***
+def _is_active_neighbor(server_id: int) -> bool:
+    for (nid, _ip, _port, _cost) in state["neighbors"]:
+        if nid == server_id:
+            return True
+    return False
+
 #LG
 # function to recieve packets from neighbors
 def receive_loop():
     s = state["sock"]                                   # creates socket
-    while True:                                         # while loop to continously look out for data
+    while True:                                         # while loop to continuously look out for data
         try:
             data, (src_ip, src_port) = s.recvfrom(1024) # tries to get the data in the packet
             # find sender ID
@@ -232,10 +241,14 @@ def receive_loop():
                 if ip == src_ip and port == src_port:
                     sender = sid
                     break
-            if sender is not None:                      # if state to print out msg of rcvd msg from server, else state to print unknown sender
-                print("--> RECEIVED A MESSAGE FROM SERVER",sender,"(%s:%d)" % (src_ip,src_port))
-            else:
-                print("--> RECEIVED from unknown %s:%d" % (src_ip, src_port))
+
+            # Ignore packets from unknown senders or from servers that are no
+            # longer in our neighbor list (e.g., after 'disable').
+            if sender is None or not _is_active_neighbor(sender):
+                continue
+
+            # RECEIVED A MESSAGE FROM SERVER <server-ID>
+            print(f"RECEIVED A MESSAGE FROM SERVER {sender}")
 
             #IV --- parse packet and feed routing_core if available ---
             try:
@@ -260,16 +273,259 @@ def receive_loop():
                     c = struct.unpack_from("!f", data, off)[0]; off += 4
                     vec[dest_id] = float('inf') if c == -1.0 else float(c)
 
-                if sender is not None:
-                    note_heartbeat(sender)
-                    apply_neighbor_vector(sender, vec)
+                note_heartbeat(sender)
+                apply_neighbor_vector(sender, vec)
+                # *** ADDED FOR PART 5: count packets for 'packets' command ***
+                state["packets_received"] += 1
             except Exception:
                 # If core isn't available or parsing fails, keep original behavior
                 pass
             #IV --- end core feed ---
 
-        except:                                         # if error break from program
+        # *** MODIFIED FOR WINDOWS UDP BEHAVIOR (ConnectionResetError) ***
+        except ConnectionResetError:
+            # On Windows, sending to a UDP port with no listener causes recvfrom()
+            # to raise ConnectionResetError(10054). We just ignore this and keep listening.
+            continue
+        except Exception:
+            # other fatal error: break out of loop
             break
+
+
+# =====================================================================
+#  COMMAND HANDLERS (PART 4 + PART 5)
+# =====================================================================
+
+def cmd_update(tokens):
+    """
+    Handle: update <server-ID1> <server-ID2> <Link Cost>
+
+    This updates the local neighbor cost (if this server is one of the
+    endpoints) and notifies routing_core so the distance-vector table
+    is recomputed.
+    """
+    cmd_str = tokens[0]
+
+    # Expect exactly 4 tokens: update s1 s2 cost
+    if len(tokens) != 4:
+        print(f"{cmd_str} ERROR: wrong number of arguments")
+        return
+
+    # Parse server IDs
+    try:
+        s1 = int(tokens[1])
+        s2 = int(tokens[2])
+    except ValueError:
+        print(f"{cmd_str} ERROR: server IDs must be integers")
+        return
+
+    # Parse cost (may be a number or 'inf')
+    cost_tok = tokens[3].strip()
+    if cost_tok.lower() == "inf":
+        new_cost_core = float("inf")   # for routing_core
+        new_cost_wire = -1.0           # for our wire format (build_update_packet)
+    else:
+        try:
+            new_cost_core = float(cost_tok)
+            new_cost_wire = new_cost_core
+        except ValueError:
+            print(f"{cmd_str} ERROR: invalid link cost")
+            return
+
+    # See if THIS server is one of the endpoints
+    my_id = state["own_id"]
+    if my_id not in (s1, s2):
+        # Valid command, but this particular process does nothing.
+        # Spec says still print "<command-string> SUCCESS".
+        print(f"{cmd_str} SUCCESS")
+        return
+
+    # Determine the neighbor ID on the other side of the link
+    neighbor_id = s2 if my_id == s1 else s1
+
+    # --- update neighbor list (id, ip, port, cost) -> set new cost ---
+    updated = False
+    new_neighbors = []
+    for (nid, ip, port, c) in state["neighbors"]:
+        if nid == neighbor_id:
+            new_neighbors.append((nid, ip, port, new_cost_wire))
+            updated = True
+        else:
+            new_neighbors.append((nid, ip, port, c))
+
+    if not updated:
+        print(f"{cmd_str} ERROR: server {neighbor_id} is not a neighbor")
+        return
+
+    state["neighbors"] = new_neighbors
+
+    # --- notify routing_core so DV tables update ---
+    try:
+        from routing_core import set_direct_cost
+        set_direct_cost(s1, s2, new_cost_core)
+    except Exception:
+        # If routing_core isn’t present (during early testing), ignore
+        pass
+
+    # Optionally send an immediate update reflecting the new cost
+    send_update()
+
+    print(f"{cmd_str} SUCCESS")
+
+
+def cmd_step(tokens):
+    cmd_str = tokens[0]
+    send_update()
+    print(f"{cmd_str} SUCCESS")
+
+
+def cmd_packets(tokens):
+    cmd_str = tokens[0]
+    count = state.get("packets_received", 0)
+    print(f"{cmd_str} SUCCESS")
+    # spec allows additional output; print the count on its own line
+    print(count)
+    state["packets_received"] = 0
+
+
+def cmd_display(tokens):
+    cmd_str = tokens[0]
+    print(f"{cmd_str} SUCCESS")
+
+    # First try to display using routing_core snapshot if available
+    used_core = False
+    try:
+        from routing_core import snapshot
+        entries = snapshot()  # list of (dest, next_hop, cost)
+        # sort by destination id
+        entries = sorted(entries, key=lambda t: t[0])
+        print("dest-id  next-hop  cost-of-path")
+        for dest, nh, c in entries:
+            cost_str = "inf" if c == float('inf') else f"{c:.3f}"
+            nh_str = "-1" if nh is None else str(nh)
+            print(f"{dest:7d}  {nh_str:8s}  {cost_str}")
+        used_core = True
+    except Exception:
+        used_core = False
+
+    if not used_core:
+        # fallback: derive something simple from neighbor list
+        print("dest-id  next-hop  cost-of-path")
+        for sid in sorted(state["all_servers"].keys()):
+            if sid == state["own_id"]:
+                print(f"{sid:7d}  {sid:8d}  0.000")
+            else:
+                nh = None
+                cost = float('inf')
+                for (nid, _ip, _port, c) in state["neighbors"]:
+                    if nid == sid and c != -1.0:
+                        nh = nid
+                        cost = c
+                        break
+                cost_str = "inf" if cost == float('inf') else f"{cost:.3f}"
+                nh_str = "-1" if nh is None else str(nh)
+                print(f"{sid:7d}  {nh_str:8s}  {cost_str}")
+
+
+def cmd_disable(tokens):
+    """
+    Handle: disable <server-ID>
+
+    Close the link to a given server:
+    - stop sending updates to that server
+    - mark the direct cost to INF in routing_core
+    """
+    cmd_str = tokens[0]
+
+    if len(tokens) != 2:
+        print(f"{cmd_str} ERROR: wrong number of arguments")
+        return
+
+    # parse the server ID to disable
+    try:
+        target_id = int(tokens[1])
+    except ValueError:
+        print(f"{cmd_str} ERROR: invalid server ID")
+        return
+
+    my_id = state["own_id"]
+    if target_id == my_id:
+        print(f"{cmd_str} ERROR: cannot disable self")
+        return
+
+    # --- remove target from neighbor list so we no longer SEND to it ---
+    found = False
+    new_neighbors = []
+    for (nid, ip, port, cost) in state["neighbors"]:
+        if nid == target_id:
+            found = True
+            # do NOT append – effectively closing the local link
+        else:
+            new_neighbors.append((nid, ip, port, cost))
+
+    if not found:
+        print(f"{cmd_str} ERROR: server {target_id} is not a neighbor")
+        return
+
+    state["neighbors"] = new_neighbors
+
+    # --- tell routing_core the direct cost is now INF ---
+    try:
+        from routing_core import set_direct_cost
+        set_direct_cost(my_id, target_id, float("inf"))
+    except Exception:
+        # if routing_core isn't available for some reason, ignore
+        pass
+
+    print(f"{cmd_str} SUCCESS")
+
+
+
+def cmd_crash(tokens):
+    cmd_str = tokens[0]
+    # spec doesn't require SUCCESS string here; just close and exit
+    print(f"{cmd_str} SUCCESS")
+    if state["timer"]:
+        state["timer"].cancel()
+        state["timer"] = None
+    if state["sock"]:
+        try:
+            state["sock"].close()
+        except Exception:
+            pass
+        state["sock"] = None
+    sys.exit(0)
+
+
+def command_loop():
+    """Read commands from stdin and dispatch to handlers."""
+    while True:
+        try:
+            line = input()
+        except EOFError:
+            break
+        line = line.strip()
+        if not line:
+            continue
+
+        tokens = line.split()
+        cmd = tokens[0].lower()
+
+        if cmd == "update":
+            cmd_update(tokens)
+        elif cmd == "step":
+            cmd_step(tokens)
+        elif cmd == "packets":
+            cmd_packets(tokens)
+        elif cmd == "display":
+            cmd_display(tokens)
+        elif cmd == "disable":
+            cmd_disable(tokens)
+        elif cmd == "crash":
+            cmd_crash(tokens)
+        else:
+            # follow "<command-string> <error message>" format
+            print(f"{tokens[0]} ERROR: unknown command")
 
 #LG
 # function to start the server
@@ -286,9 +542,9 @@ def server(topo_file, interval):
     schedule_next_update()                                              # start the udp packet update timer
 
 
-    try:                                        
-        while True:                                                     # continuos while loop to keep server up
-            pass
+    try:
+        # *** MODIFIED FOR PART 4: run command interpreter instead of busy loop ***
+        command_loop()
     except KeyboardInterrupt:
         print("--> exiting ")
 
