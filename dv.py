@@ -5,7 +5,6 @@
 -Programming Assignment #2 Distance Vector
 -11/11/25
 """
-
 import socket
 import struct
 import threading
@@ -119,6 +118,34 @@ def parse_topology(topology_file):
         neigh_ids.append(str(n[0]))
     print("--> Neighbors: " + ", ".join(neigh_ids))
 
+    #IV --- initialize routing core after topology is loaded ---
+    try:
+        from routing_core import init_core
+        neighbor_costs = {}
+        for (nid, _ip, _port, c) in state["neighbors"]:
+            neighbor_costs[nid] = float('inf') if c == -1.0 else float(c)
+        all_ids = sorted(state["all_servers"].keys())
+        update_interval = int(state["interval"]) if state["interval"] else 1
+        init_core(state["own_id"], all_ids, neighbor_costs, update_interval)
+    except Exception as _e:
+        # If routing_core isn’t present during early testing, do nothing.
+        pass
+
+    #IV --- start failure sweeper thread (calls expire_silent_neighbors) ---
+    def _iv_failure_sweeper():
+        try:
+            from routing_core import expire_silent_neighbors
+        except Exception:
+            return
+        period = max(1.0, float(state["interval"]) / 2.0) if state["interval"] else 1.0
+        while True:
+            try:
+                expire_silent_neighbors()
+            finally:
+                threading.Event().wait(period)
+    threading.Thread(target=_iv_failure_sweeper, daemon=True).start()
+    #IV --- end core init additions ---
+
 #LG
 # helper function to create udp packets to update the neighbors with
 def build_update_packet():
@@ -129,6 +156,25 @@ def build_update_packet():
     for sid in state["all_servers"]:                # for loop to make the unreachable servers infinity
         if sid not in cost:
             cost[sid] = -1.0                     
+
+    #IV --- replace cost with snapshot from routing_core when available ---
+    try:
+        from routing_core import snapshot
+        new_cost = {}
+        # snapshot returns list of (dest, next_hop, cost)
+        for (dest, _nh, c) in snapshot():
+            # encode INF as -1.0 to match Leo’s original wire format
+            new_cost[dest] = -1.0 if c == float('inf') else float(c)
+        # ensure every known server is present
+        for sid in state["all_servers"].keys():
+            new_cost.setdefault(sid, -1.0)
+        # self cost must be 0.0
+        new_cost[state["own_id"]] = 0.0
+        cost = new_cost
+    except Exception:
+        # if snapshot not available, keep Leo’s original neighbor-only vector
+        pass
+    #IV --- end snapshot substitution ---
 
     pkt = struct.pack("!I", len(cost))              # number of update fields, !I means network int 4 byte 
     pkt += struct.pack("!H", state["own_port"])     # own port, means network, !H meants network short 2 byte
@@ -190,6 +236,38 @@ def receive_loop():
                 print("--> RECEIVED A MESSAGE FROM SERVER",sender,"(%s:%d)" % (src_ip,src_port))
             else:
                 print("--> RECEIVED from unknown %s:%d" % (src_ip, src_port))
+
+            #IV --- parse packet and feed routing_core if available ---
+            try:
+                from routing_core import note_heartbeat, apply_neighbor_vector
+                off = 0
+                if len(data) < 4 + 2 + 4:
+                    continue
+                num_fields = struct.unpack_from("!I", data, off)[0]; off += 4
+                snd_port   = struct.unpack_from("!H", data, off)[0]; off += 2
+                snd_ip_raw = data[off:off+4]; off += 4
+                _snd_ip    = socket.inet_ntoa(snd_ip_raw)
+
+                vec = {}
+                # Each entry: dest_ip(4) dest_port(H) zero(B) dest_id(I) cost(f)
+                for _ in range(num_fields):
+                    if off + 4 + 2 + 1 + 4 + 4 > len(data):
+                        break
+                    _dip = data[off:off+4]; off += 4
+                    _dport = struct.unpack_from("!H", data, off)[0]; off += 2
+                    _zero  = data[off]; off += 1
+                    dest_id = struct.unpack_from("!I", data, off)[0]; off += 4
+                    c = struct.unpack_from("!f", data, off)[0]; off += 4
+                    vec[dest_id] = float('inf') if c == -1.0 else float(c)
+
+                if sender is not None:
+                    note_heartbeat(sender)
+                    apply_neighbor_vector(sender, vec)
+            except Exception:
+                # If core isn't available or parsing fails, keep original behavior
+                pass
+            #IV --- end core feed ---
+
         except:                                         # if error break from program
             break
 
