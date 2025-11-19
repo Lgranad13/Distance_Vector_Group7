@@ -75,10 +75,10 @@ def parse_topology(topology_file):
         i = i + 1
 
     ## commented out for testing local only for now
-    #local_ip = socket.gethostbyname(socket.gethostname())   # gets self ip
+    local_ip = socket.gethostbyname(socket.gethostname())   # gets self ip
 
     #this is only for testing locally
-    local_ip = "127.0.0.1"
+    #local_ip = "127.0.0.1"
 
     state["sock"] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     own_id   = None
