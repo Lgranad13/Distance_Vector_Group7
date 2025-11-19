@@ -76,6 +76,7 @@ def parse_topology(topology_file):
 
     ## commented out for testing local only for now
     local_ip = socket.gethostbyname(socket.gethostname())   # gets self ip
+    local_ip = socket.gethostbyname(socket.gethostname())   # gets self ip
 
     #this is only for testing locally
     #local_ip = "127.0.0.1"
